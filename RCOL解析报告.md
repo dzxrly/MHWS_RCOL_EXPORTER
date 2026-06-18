@@ -226,7 +226,7 @@ RSZ 的解析流程：
 2. 读取 instance info 表。每条包含 `class_hash` 和 `crc`。
 3. 用 `rszmhws.json` 把 `class_hash` 映射到类名和字段定义。
 4. 用 `il2cpp_dump.json` 补充 enum 标签、字段 enum hint、generic 容器关系和 native shape 参数偏移。
-5. 根据 RCOL 版本处理 native 字段差异，再按字段定义读取 instance 数据区。
+5. 根据 RCOL 版本提示和候选解析评分处理 native 字段差异，再按字段定义读取 instance 数据区。
 6. 对 `Object`、`UserData` 字段保留或展开 `ref_instance_id` 引用。
 
 例如攻击碰撞文件中常见：
@@ -257,10 +257,19 @@ v1: Data
 v2: Data
 ```
 
-在 `*.rcol.38` 中，`v2` 对应 `RequestSetIndex`；在 `*.rcol.28` 中这一字段实际不存在。如果按 `.38` schema 直接解析 `.28`，后续 `_Attack`、`_StunDamage` 等字段会整体错位。当前实现按文件扩展版本判断：
+在 `*.rcol.38` 中，`v2` 对应 `RequestSetIndex`；在 `*.rcol.28` 中这一字段实际不存在。如果按 `.38` schema 直接解析 `.28`，后续 `_Attack`、`_StunDamage` 等字段会整体错位。当前实现不再只靠文件扩展名硬切，而是把扩展名作为优先候选提示：
 
 - `.rcol.28`：跳过 native `v2`。
 - `.rcol.38`：读取 native `v2` 并输出为 `RequestSetIndex`。
+
+同时解析器会从当前 `rszmhws.json` 中扫描实际参与解析的类，生成可用的 native `v*` 头字段数量候选，例如读取 `v0/v1` 或读取 `v0/v1/v2`。每个候选都会试解析一次，再根据以下指标选择最可信结果：
+
+- `RequestSetIndex` 是否与 RCOL 外层 `requestSetIndex` 一致。
+- RSZ instance 是否出现 `unparsed`。
+- 对象引用是否出现负数、缺失或未解析引用。
+- RCOL request set 指向的 object table 下标是否合法。
+
+因此 `.28` 使用最新版 schema 时仍会自动选择跳过 `v2` 的解析方式，`.38` 则会选择读取 `v2` 的解析方式。未来如果最新版 schema 中出现更多 `v3`、`v4` native 占位字段，候选集合也会随 schema 扩展；未知语义字段会先保留为原始 `vN`，避免强行猜名导致误导。
 
 ## readable JSON
 
@@ -309,6 +318,8 @@ v2: Data
 ```
 
 `_binary.data` 是完整原始 RCOL 文件的十六进制内容。只要这个字段存在，就可以字节级恢复原文件，因此当前 `repack` JSON 是无损的。
+
+`repack.rsz._diagnostics` 会保留自动解析选择信息，包括选中的 `native_field_count`、候选分数、`unparsed_instances`、非法引用数量和 `RequestSetIndex` 匹配情况。需要调查游戏更新导致的结构变化时，优先查看这里。
 
 解析出的 `rcol` 和 `rsz` 结构用于辅助理解、定位和后续编辑器开发。未来如果要实现真正的“修改 JSON 后重新打包”，推荐按这个顺序推进：
 

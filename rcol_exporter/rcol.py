@@ -32,7 +32,7 @@ from .layout import (
     shape_param_layout,
     shape_type_labels,
 )
-from .rsz import RszBlockParser
+from .rsz import RszBlockParser, native_field_count_candidates
 
 
 def parse_rcol(path: Path, typedb: TypeDB, il2cpp_path: Path | None = None) -> dict[str, Any]:
@@ -66,13 +66,14 @@ def parse_rcol(path: Path, typedb: TypeDB, il2cpp_path: Path | None = None) -> d
     rsz_start = offsets["rsz"]
     request_start = offsets["request_sets"]
     rsz_end = request_start if request_start > rsz_start else string_start
-    has_request_set_index = rcol_version(path) >= 38
     if 0 < rsz_start < len(data) and rsz_end > rsz_start:
-        result["rsz"] = RszBlockParser(
+        result["rsz"] = parse_rsz_auto(
+            data[rsz_start:rsz_end],
             typedb,
             il2cpp_path=il2cpp_path,
-            has_request_set_index=has_request_set_index,
-        ).parse(data[rsz_start:rsz_end])
+            request_sets=request_sets,
+            version_hint=rcol_version(path),
+        )
     else:
         result["rsz"] = {"error": "missing_or_invalid_rsz"}
     result["requestSets"] = attach_request_userdata(request_sets, result["rsz"])
@@ -86,6 +87,141 @@ def rcol_version(path: Path) -> int:
         return int(path.name.rsplit(".", 1)[-1])
     except ValueError:
         return 0
+
+
+def parse_rsz_auto(
+    block: bytes,
+    typedb: TypeDB,
+    il2cpp_path: Path | None,
+    request_sets: list[dict[str, Any]],
+    version_hint: int,
+) -> dict[str, Any]:
+    preferred = 3 if version_hint >= 38 else 2
+    candidates = native_field_count_candidates(block, typedb, preferred=preferred)
+    attempts: list[dict[str, Any]] = []
+    best: dict[str, Any] | None = None
+    best_score: tuple[int, int, int] | None = None
+    first_error: Exception | None = None
+
+    for native_count in candidates:
+        try:
+            parsed = RszBlockParser(
+                typedb,
+                il2cpp_path=il2cpp_path,
+                native_field_count=native_count,
+            ).parse(block)
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            attempts.append(
+                {
+                    "native_field_count": native_count,
+                    "score": -1_000_000,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+            continue
+
+        stats = score_rsz_parse(parsed, request_sets)
+        diagnostics = parsed.setdefault("_diagnostics", {})
+        diagnostics.update(stats)
+        score_tuple = (
+            int(stats["score"]),
+            1 if native_count == preferred else 0,
+            int(stats["request_index_matches"]),
+        )
+        attempts.append(
+            {
+                "native_field_count": native_count,
+                "score": stats["score"],
+                "unparsed_instances": stats["unparsed_instances"],
+                "missing_refs": stats["missing_refs"],
+                "invalid_object_indices": stats["invalid_object_indices"],
+                "request_index_matches": stats["request_index_matches"],
+                "request_index_mismatches": stats["request_index_mismatches"],
+                "request_index_present": stats["request_index_present"],
+            }
+        )
+        if best_score is None or score_tuple > best_score:
+            best = parsed
+            best_score = score_tuple
+
+    if best is None:
+        if first_error is not None:
+            raise first_error
+        raise ValueError("no RSZ native field candidates were available")
+
+    best.setdefault("_diagnostics", {})["candidate_scores"] = attempts
+    return best
+
+
+def score_rsz_parse(parsed: dict[str, Any], request_sets: list[dict[str, Any]]) -> dict[str, Any]:
+    diagnostics = parsed.get("_diagnostics") or {}
+    object_table = parsed.get("object_table") or []
+    trees = parsed.get("object_trees") or {}
+    unparsed_instances = int(diagnostics.get("unparsed_instances") or 0)
+
+    invalid_object_indices = 0
+    request_index_present = 0
+    request_index_matches = 0
+    request_index_mismatches = 0
+    missing_refs = count_problem_refs(trees)
+
+    for request_set in request_sets:
+        indices = request_set.get("_object_table_indices") or {}
+        expected_index = request_set.get("requestSetIndex")
+        for role in ("userData", "nativeShapeCollider"):
+            table_index = indices.get(role)
+            if not isinstance(table_index, int) or table_index < 0 or table_index >= len(object_table):
+                invalid_object_indices += 1
+                continue
+            root_id = object_table[table_index]
+            payload = single_class_payload(trees.get(str(root_id), {}))
+            if not isinstance(payload, dict) or "RequestSetIndex" not in payload:
+                continue
+            request_index_present += 1
+            value = payload.get("RequestSetIndex")
+            if isinstance(value, int) and value == expected_index:
+                request_index_matches += 1
+            else:
+                request_index_mismatches += 1
+
+    score = (
+        request_index_matches * 100
+        - request_index_mismatches * 500
+        - unparsed_instances * 300
+        - missing_refs * 80
+        - invalid_object_indices * 500
+    )
+    return {
+        "score": score,
+        "unparsed_instances": unparsed_instances,
+        "missing_refs": missing_refs,
+        "invalid_object_indices": invalid_object_indices,
+        "request_index_present": request_index_present,
+        "request_index_matches": request_index_matches,
+        "request_index_mismatches": request_index_mismatches,
+    }
+
+
+def single_class_payload(value: Any) -> Any:
+    if isinstance(value, dict) and len(value) == 1:
+        return next(iter(value.values()))
+    return value
+
+
+def count_problem_refs(value: Any) -> int:
+    if isinstance(value, dict):
+        total = 0
+        ref_id = value.get("ref_instance_id")
+        if isinstance(ref_id, int) and (ref_id < 0 or value.get("missing") or value.get("unparsed")):
+            total += 1
+        for child in value.values():
+            total += count_problem_refs(child)
+        return total
+    if isinstance(value, list):
+        return sum(count_problem_refs(item) for item in value)
+    return 0
 
 
 def parse_header(data: bytes) -> dict[str, Any]:
@@ -274,8 +410,8 @@ def attach_request_userdata(request_sets: list[dict[str, Any]], rsz: dict[str, A
     out: list[dict[str, Any]] = []
     for item in request_sets:
         indices = item.pop("_object_table_indices")
-        user_root = object_table[indices["userData"]] if indices["userData"] < len(object_table) else None
-        native_root = object_table[indices["nativeShapeCollider"]] if indices["nativeShapeCollider"] < len(object_table) else None
+        user_root = object_table_value(object_table, indices["userData"])
+        native_root = object_table_value(object_table, indices["nativeShapeCollider"])
         item["nativeShapeColliders"] = [trees.get(str(native_root), {"Ref": {"ref_instance_id": native_root}})]
         item["userData"] = trees.get(str(user_root), {"Ref": {"ref_instance_id": user_root}})
         item["_raw"]["object_table_indices"] = indices
@@ -285,6 +421,12 @@ def attach_request_userdata(request_sets: list[dict[str, Any]], rsz: dict[str, A
         }
         out.append(item)
     return out
+
+
+def object_table_value(object_table: list[Any], index: Any) -> Any:
+    if isinstance(index, int) and 0 <= index < len(object_table):
+        return object_table[index]
+    return None
 
 
 def parse_ignore_tags(data: bytes, header: dict[str, Any], string_start: int) -> list[dict[str, Any]]:

@@ -11,16 +11,78 @@ from .binary import RSZ_MAGIC, hx, u32
 from .il2cpp import Il2cppMetadata
 
 
+def native_prefix_length(cls: Any) -> int:
+    count = 0
+    for field in getattr(cls, "fields", []) or []:
+        if field.name != f"v{count}":
+            break
+        if field.original_type or field.is_array:
+            break
+        count += 1
+    return count
+
+
+def native_field_count_candidates(
+    block: bytes,
+    typedb: TypeDB,
+    preferred: int | None = None,
+) -> list[int]:
+    candidates: list[int] = []
+    if preferred is not None:
+        candidates.append(preferred)
+
+    try:
+        reader = BinaryReader(block)
+        if len(block) < 48 or reader.read_u32() != RSZ_MAGIC:
+            return _unique_candidates(candidates)
+        reader.read_u32()
+        reader.read_s32()
+        instance_count = reader.read_s32()
+        reader.read_s32()
+        reader.read_s32()
+        instance_offset = reader.read_s64()
+        reader.read_s64()
+        reader.read_s64()
+
+        max_prefix = 0
+        reader.seek(instance_offset)
+        for _ in range(max(instance_count, 0)):
+            class_hash = reader.read_u32()
+            reader.read_u32()
+            cls = typedb.get_class(class_hash)
+            if cls is not None:
+                max_prefix = max(max_prefix, native_prefix_length(cls))
+        if max_prefix >= 2:
+            candidates.extend(range(2, max_prefix + 1))
+    except Exception:
+        pass
+
+    return _unique_candidates(candidates)
+
+
+def _unique_candidates(values: list[int]) -> list[int]:
+    out: list[int] = []
+    for value in values:
+        if value < 0 or value in out:
+            continue
+        out.append(value)
+    return out
+
+
 class RszBlockParser(ExporterFieldParserMixin):
     def __init__(
         self,
         typedb: TypeDB,
         il2cpp_path: str | Path | None = None,
-        has_request_set_index: bool = True,
+        has_request_set_index: bool | None = True,
+        native_field_count: int | None = None,
     ):
         self.typedb = typedb
         self.metadata = Il2cppMetadata(il2cpp_path)
-        self.has_request_set_index = has_request_set_index
+        if native_field_count is None:
+            native_field_count = 3 if has_request_set_index else 2
+        self.native_field_count = native_field_count
+        self.has_request_set_index = native_field_count >= 3
         self._instances: dict[int, dict[str, Any]] = {}
 
     def parse(self, block: bytes) -> dict[str, Any]:
@@ -89,6 +151,11 @@ class RszBlockParser(ExporterFieldParserMixin):
             "instance_infos": instance_infos,
             "instances": parsed_instances,
             "object_trees": object_trees,
+            "_diagnostics": {
+                "native_field_count": self.native_field_count,
+                "has_request_set_index": self.has_request_set_index,
+                "unparsed_instances": sum(1 for item in parsed_instances if item.get("unparsed")),
+            },
         }
 
     def _read_userdata(
@@ -183,22 +250,22 @@ class RszBlockParser(ExporterFieldParserMixin):
             raise ParseError(f"class hash 0x{class_hash:08x} not found in schema")
         out: dict[str, Any] = {"_class": cls.name, "fields": {}}
         for idx, field in enumerate(cls.fields):
-            if self._skip_native_v2(cls.name, idx, field.name):
+            if self._skip_versioned_native_field(cls.name, idx, field.name):
                 continue
             reader.seek(align(reader.tell(), 4 if field.is_array else max(field.align, 1)))
             out["fields"][field.name or "unnamed"] = self._parse_field_value(reader, field, depth=0)
         return out
 
-    def _skip_native_v2(self, class_name: str, field_index: int, field_name: str) -> bool:
-        if self.has_request_set_index:
+    def _skip_versioned_native_field(self, class_name: str, field_index: int, field_name: str) -> bool:
+        if field_index < self.native_field_count:
             return False
-        if field_name != "v2" or field_index != 2:
+        if field_name != f"v{field_index}":
             return False
         cls_hash = self.typedb.name_to_hash.get(class_name)
         cls = self.typedb.get_class(cls_hash) if cls_hash is not None else None
-        if cls is None or len(cls.fields) < 3:
+        if cls is None:
             return False
-        return [field.name for field in cls.fields[:3]] == ["v0", "v1", "v2"]
+        return native_prefix_length(cls) > field_index
 
     def build_tree(self, index: int, depth: int = 6, visited: set[int] | None = None) -> dict[str, Any]:
         if visited is None:

@@ -22,6 +22,8 @@ python -m pip install -r .\requirements.txt
 
 如果这两个文件放在输入目录附近、当前目录或 `debug/` 下，工具会自动查找。
 
+解析 RSZ 用户数据时，工具会把 RCOL 文件扩展版本作为提示，并结合当前 `rszmhws.json` 自动尝试不同数量的 native `v*` 头字段。候选结果会按 `RequestSetIndex` 一致性、非法引用和未解析 instance 数量打分，避免新版 schema 解析旧文件时出现字段整体错位。
+
 ## 快速开始
 
 使用 `main.py` 导出一个目录：
