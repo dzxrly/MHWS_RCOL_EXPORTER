@@ -143,5 +143,5 @@ def display_path(path: str | Path | None) -> str | None:
         if value.is_absolute():
             return value.relative_to(Path.cwd()).as_posix()
     except ValueError:
-        return value.name
+        return str(value)
     return value.as_posix()

@@ -43,9 +43,12 @@ def add_export_args(parser: argparse.ArgumentParser, positional: bool = False) -
     )
     parser.add_argument(
         "--format",
-        choices=("readable", "repack", "both"),
+        choices=("readable", "readable-debug", "repack", "both"),
         default="readable",
-        help="readable is compact and editable; repack embeds lossless bytes.",
+        help=(
+            "readable is clean and editable; readable-debug adds diagnostics; "
+            "repack embeds lossless bytes."
+        ),
     )
     parser.add_argument("--limit", type=int, default=0, help="Optional processing limit.")
 
@@ -76,10 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_export_args(export_parser)
     export_parser.set_defaults(func=run_export)
 
-    web_parser = subparsers.add_parser("web", help="Start the local Web quick exporter.")
-    web_parser.add_argument("--host", default="127.0.0.1", help="Host interface for the local server.")
-    web_parser.add_argument("--port", type=int, default=8766, help="TCP port for the local server.")
-    web_parser.set_defaults(func=run_web)
+    gui_parser = subparsers.add_parser(
+        "gui",
+        aliases=("ui",),
+        help="Open the Tkinter desktop exporter.",
+    )
+    gui_parser.set_defaults(func=run_gui)
     return parser
 
 
@@ -109,16 +114,16 @@ def run_legacy_export(args: argparse.Namespace) -> int:
     return run_export(args)
 
 
-def run_web(args: argparse.Namespace) -> int:
-    from .web.server import run_server
+def run_gui(args: argparse.Namespace) -> int:
+    from .gui import run_gui as launch_gui
 
-    run_server(host=args.host, port=args.port)
+    launch_gui()
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    if raw_args and raw_args[0] not in {"export", "web", "-h", "--help", "--version"}:
+    if raw_args and raw_args[0] not in {"export", "gui", "ui", "-h", "--help", "--version"}:
         legacy = build_legacy_parser()
         args = legacy.parse_args(raw_args)
         return args.func(args)

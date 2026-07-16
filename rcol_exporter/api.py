@@ -9,11 +9,11 @@ from pyreuser3.schema import TypeDB
 
 from .binary import display_path
 from .detect import build_layout_hint, detect_rcol_layout
-from .formats import build_readable, build_repack
+from .formats import build_readable, build_readable_debug, build_repack
 from .rcol import parse_rcol
 
 
-JsonFormat = Literal["readable", "repack"]
+JsonFormat = Literal["readable", "readable_debug", "repack"]
 RCOL_RE = re.compile(r"\.rcol\.\d+$", re.IGNORECASE)
 
 
@@ -60,8 +60,8 @@ def find_il2cpp_dump(input_path: str | Path, explicit: str | Path | None = None)
 
 def normalize_json_format(json_format: str) -> JsonFormat:
     normalized = json_format.strip().lower().replace("-", "_")
-    if normalized not in {"readable", "repack"}:
-        raise ValueError("json_format must be 'readable' or 'repack'")
+    if normalized not in {"readable", "readable_debug", "repack"}:
+        raise ValueError("json_format must be 'readable', 'readable-debug', or 'repack'")
     return normalized  # type: ignore[return-value]
 
 
@@ -80,7 +80,8 @@ def default_output_path(
     json_format: str,
     split_formats: bool,
 ) -> Path:
-    output_name = f"{source.name}.{json_format}.json" if split_formats else f"{source.name}.json"
+    format_label = json_format.replace("_", "-")
+    output_name = f"{source.name}.{format_label}.json" if split_formats else f"{source.name}.json"
     if output_root is None:
         return source.with_name(output_name)
     relative_parent = source.relative_to(input_root).parent if input_root.is_dir() else Path()
@@ -103,6 +104,8 @@ class RCOLConverter:
         parsed = parse_rcol(source, self.typedb, il2cpp_path=self.il2cpp_dump_path)
         if normalized_format == "readable":
             return build_readable(parsed, self.schema_path, self.il2cpp_dump_path)
+        if normalized_format == "readable_debug":
+            return build_readable_debug(parsed, self.schema_path, self.il2cpp_dump_path)
         return build_repack(parsed, self.schema_path, self.il2cpp_dump_path)
 
     def export_file(
@@ -182,11 +185,16 @@ class RCOLConverter:
                     layout_hint=layout_hint,
                 )
                 for one_format in formats:
-                    document = (
-                        build_readable(parsed, self.schema_path, self.il2cpp_dump_path)
-                        if one_format == "readable"
-                        else build_repack(parsed, self.schema_path, self.il2cpp_dump_path)
-                    )
+                    if one_format == "readable":
+                        document = build_readable(parsed, self.schema_path, self.il2cpp_dump_path)
+                    elif one_format == "readable_debug":
+                        document = build_readable_debug(
+                            parsed,
+                            self.schema_path,
+                            self.il2cpp_dump_path,
+                        )
+                    else:
+                        document = build_repack(parsed, self.schema_path, self.il2cpp_dump_path)
                     target = default_output_path(source, root, output_dir, one_format, split_formats)
                     write_json(target, document)
                     summary["written"].append(display_path(target))

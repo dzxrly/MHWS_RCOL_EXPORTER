@@ -55,7 +55,7 @@ xxx.rcol.38.readable.json
 xxx.rcol.38.repack.json
 ```
 
-## 库与 Web 入口
+## 库与桌面 UI 入口
 
 可以在 Python 代码中直接使用 `RCOLConverter`：
 
@@ -72,21 +72,21 @@ tree = converter.rcol_to_json(
 )
 ```
 
-本地 Web 快速导出入口：
+Tkinter 桌面导出入口：
 
 ```powershell
-python -m rcol_exporter web --port 8766
+python -m rcol_exporter gui
 ```
 
-打开 `http://127.0.0.1:8766/` 后页面上方只有两个来源按钮：`Select file` 用于选择单个 RCOL 文件，`Select folder` 用于选择一个 RCOL 目录。下方的输出目录、schema 和 dump 仍保留选择器；点击导出后页面会显示进度条直到 export 完成。Web 页面和 CLI 调用的是同一个 `RCOLConverter`，因此输出结构一致。
+窗口支持选择单个 RCOL 文件或整个目录，并设置输出目录、schema、dump、输出格式和 limit。schema 必须显式选择；dump 留空表示禁用，GUI 不会自动替换 metadata。导出在线程中执行，主线程只负责 Tkinter 事件循环和结果展示，因此加载大 metadata 或批量转换时窗口不会冻结。桌面 UI 和 CLI 调用的是同一个 `RCOLConverter`，因此输出结构一致；当前实现不再包含 HTTP server、文件上传或 HTML/JavaScript 前端。
 
 当前代码结构：
 
 | 路径 | 作用 |
 | --- | --- |
 | `rcol_exporter/api.py` | 对外库 API，提供单文件和目录导出 |
-| `rcol_exporter/cli.py` | 命令行入口，支持 `export` 和 `web` |
-| `rcol_exporter/web/server.py` | 标准库 HTTP server 快速导出页面 |
+| `rcol_exporter/cli.py` | 命令行入口，支持 `export` 和 `gui`/`ui` |
+| `rcol_exporter/gui.py` | Tkinter 桌面导出窗口和后台任务调度 |
 | `rcol_exporter/layout.py` | RCOL 外层 header/group/shape/request-set 的结构表和 shape 参数模板 |
 | `rcol_exporter/rcol.py` | RCOL 外层解析与 RSZ 块挂接 |
 | `rcol_exporter/rsz.py` | 基于 `pyreuser3` 字段解析能力的 RSZ 对象图解析 |
@@ -279,10 +279,11 @@ v2: Data
 {
   "groupInfos": [],
   "requestSets": [],
-  "ignoreTags": [],
-  "_diagnostics": {}
+  "ignoreTags": []
 }
 ```
+
+默认 `readable` 不携带布局候选、schema 覆盖率或解析评分等调试信息。需要这些信息时使用 `--format readable-debug`；其业务数据结构与 `readable` 相同，仅在顶层增加 `_diagnostics`。
 
 其中 `requestSets[*].userData` 会展开成类型名包裹的对象，例如：
 
@@ -320,7 +321,7 @@ v2: Data
 
 `_binary.data` 是完整原始 RCOL 文件的十六进制内容。只要这个字段存在，就可以字节级恢复原文件，因此当前 `repack` JSON 是无损的。
 
-`repack.rsz._diagnostics` 会保留自动解析选择信息，包括选中的 `native_field_count`、候选分数、`unparsed_instances`、非法引用数量、`RequestSetIndex` 匹配情况和 `schema_compatibility`。`readable._diagnostics` 也会保留精简后的 RCOL 布局证据与 RSZ metadata 兼容性结果。
+`repack.rsz._diagnostics` 会保留自动解析选择信息，包括选中的 `native_field_count`、候选分数、`unparsed_instances`、非法引用数量、`RequestSetIndex` 匹配情况和 `schema_compatibility`。`readable-debug._diagnostics` 会保留精简后的 RCOL 布局证据与 RSZ metadata 兼容性结果，默认 `readable` 则不包含这些字段。
 
 解析出的 `rcol` 和 `rsz` 结构用于辅助理解、定位和后续编辑器开发。未来如果要实现真正的“修改 JSON 后重新打包”，推荐按这个顺序推进：
 

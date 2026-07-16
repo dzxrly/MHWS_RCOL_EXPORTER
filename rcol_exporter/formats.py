@@ -33,11 +33,20 @@ def build_readable(parsed: dict[str, Any], schema_path: Path, il2cpp_path: Path 
         "groupInfos": strip_private(parsed.get("groupInfos", [])),
         "requestSets": strip_private(parsed.get("requestSets", [])),
         "ignoreTags": strip_private(parsed.get("ignoreTags", [])),
-        "_diagnostics": {
-            "rcol_layout": parsed.get("rcol_layout", {}),
-            "rsz": (parsed.get("rsz") or {}).get("_diagnostics", {}),
-        },
     }
+
+
+def build_readable_debug(
+    parsed: dict[str, Any],
+    schema_path: Path,
+    il2cpp_path: Path | None,
+) -> dict[str, Any]:
+    document = build_readable(parsed, schema_path, il2cpp_path)
+    document["_diagnostics"] = {
+        "rcol_layout": parsed.get("rcol_layout", {}),
+        "rsz": (parsed.get("rsz") or {}).get("_diagnostics", {}),
+    }
+    return document
 
 
 def build_repack(parsed: dict[str, Any], schema_path: Path, il2cpp_path: Path | None) -> dict[str, Any]:
