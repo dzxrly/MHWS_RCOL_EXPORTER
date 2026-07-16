@@ -8,6 +8,7 @@ from typing import Any, Literal, Sequence
 from pyreuser3.schema import TypeDB
 
 from .binary import display_path
+from .detect import build_layout_hint, detect_rcol_layout
 from .formats import build_readable, build_repack
 from .rcol import parse_rcol
 
@@ -131,16 +132,55 @@ class RCOLConverter:
             files = files[:limit]
         formats = normalize_json_formats(json_format)
         split_formats = len(formats) > 1
+        layout_hint = None
+        if len(files) > 1:
+            detected_layouts = []
+            # Directory consensus is only a performance hint.  A small,
+            # size-diverse sample avoids making the pre-pass proportional to
+            # the largest files and is never persisted as a version profile.
+            ordered = sorted(files, key=lambda item: item.stat().st_size)
+            sample_count = min(16, len(ordered))
+            anchor_indices = (
+                {
+                    round(index * (len(ordered) - 1) / (sample_count - 1))
+                    for index in range(sample_count)
+                }
+                if sample_count > 1
+                else {0}
+            )
+            anchor_files = [ordered[index] for index in sorted(anchor_indices)]
+            for anchor in anchor_files:
+                try:
+                    detected_layouts.append(detect_rcol_layout(anchor.read_bytes()))
+                except Exception:
+                    continue
+            layout_hint = build_layout_hint(detected_layouts)
         summary: dict[str, Any] = {
             "total": len(files),
             "exported": 0,
             "failed": 0,
             "written": [],
             "errors": [],
+            "layout_consensus": (
+                {
+                    "request_stride": f"0x{layout_hint.request_stride:x}",
+                    "request_fields": {
+                        key: f"0x{value:x}" for key, value in layout_hint.request_fields.items()
+                    },
+                    "group_stride": f"0x{layout_hint.group_stride:x}",
+                }
+                if layout_hint is not None
+                else None
+            ),
         }
         for source in files:
             try:
-                parsed = parse_rcol(source, self.typedb, il2cpp_path=self.il2cpp_dump_path)
+                parsed = parse_rcol(
+                    source,
+                    self.typedb,
+                    il2cpp_path=self.il2cpp_dump_path,
+                    layout_hint=layout_hint,
+                )
                 for one_format in formats:
                     document = (
                         build_readable(parsed, self.schema_path, self.il2cpp_dump_path)

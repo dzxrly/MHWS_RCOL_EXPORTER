@@ -116,7 +116,7 @@ RCOL 文件开头 4 字节是魔数：
 52 43 4F 4C = "RCOL"
 ```
 
-目前样本中 header 长度按 `0x70` 处理。这些字段不再散落在解析函数中，而是集中登记在 `rcol_exporter/layout.py` 的 `HEADER_COUNTS`、`HEADER_UNKNOWNS`、`HEADER_OFFSETS` 表里。重要偏移包括：
+早期实现把 header 长度和字段位置固定为 `0x70` 布局。当前实现改为在每个文件中扫描 header 整数和指针候选，再用后续区段的结构不变量确认含义。下表是常见布局中的位置，只作为基准候选而不是按扩展版本硬切：
 
 | 偏移 | 含义 |
 | --- | --- |
@@ -128,7 +128,7 @@ RCOL 文件开头 4 字节是魔数：
 | `0x48` | ignore tag 段偏移 |
 | `0x50` | auto generate joint desc 或字符串池附近偏移 |
 
-Header 中还有一些计数字段和未知字段。脚本会保留这些原始值，避免把尚未确认的字段误命名。
+Header 中还有一些计数字段和未知字段。脚本会保留扫描到的 `raw_u32`、`raw_u64` 和候选证据，避免把尚未确认的字段误命名。批量解析产生的目录共识只存在于当前进程内，用于优先排列候选，不会形成需要人工维护的版本画像。
 
 ## Group 表
 
@@ -170,7 +170,7 @@ Shape/Collider 记录区位于 group 表之后、RSZ 块之前。样本中每条
 
 ## RequestSet 段
 
-RequestSet 记录从 header 的 `request_sets` offset 开始，字段集中在 `REQUEST_SET_LAYOUT` 中。已按 `Wp12Attack` 样本确认每条记录为 `0x30` 字节：
+RequestSet 记录从自动确认的 `request_sets` offset 开始。`0x30` 字节和下列相对位置是常见基准候选；解析器还会根据连续 `requestSetIndex`、合法 group 索引以及 RSZ object table 的完整分区自动探测步长和核心字段位置：
 
 | 相对偏移 | 含义 |
 | --- | --- |
@@ -185,7 +185,7 @@ RequestSet 记录从 header 的 `request_sets` offset 开始，字段集中在 `
 | `0x28` | `keyHash` |
 | `0x2C` | `KeyNameMMHash` |
 
-读取 request set 后，脚本会根据 object table 下标找到对应的 RSZ root instance，再生成：
+读取 request set 后，脚本会根据 object table 下标找到对应的 RSZ root instance。一个 RequestSet 的 native collider 区间从它的 `nativeShapeColliderObjectIndex` 开始，到下一个 RequestSet 的 `userDataObjectIndex` 结束；最后一项以 RSZ `object_count` 为结束位置。因此该数组可以正确保留零个、一个或多个 collider，而不是只取起始位置的一个对象：
 
 ```json
 {
@@ -279,7 +279,8 @@ v2: Data
 {
   "groupInfos": [],
   "requestSets": [],
-  "ignoreTags": []
+  "ignoreTags": [],
+  "_diagnostics": {}
 }
 ```
 
@@ -300,8 +301,8 @@ v2: Data
 
 ```json
 {
-  "_format": "rcol_repack_v2",
-  "_version": 2,
+  "_format": "rcol_repack_v3",
+  "_version": 3,
   "_source": {},
   "_binary": {
     "encoding": "hex",
@@ -319,7 +320,7 @@ v2: Data
 
 `_binary.data` 是完整原始 RCOL 文件的十六进制内容。只要这个字段存在，就可以字节级恢复原文件，因此当前 `repack` JSON 是无损的。
 
-`repack.rsz._diagnostics` 会保留自动解析选择信息，包括选中的 `native_field_count`、候选分数、`unparsed_instances`、非法引用数量和 `RequestSetIndex` 匹配情况。需要调查游戏更新导致的结构变化时，优先查看这里。
+`repack.rsz._diagnostics` 会保留自动解析选择信息，包括选中的 `native_field_count`、候选分数、`unparsed_instances`、非法引用数量、`RequestSetIndex` 匹配情况和 `schema_compatibility`。`readable._diagnostics` 也会保留精简后的 RCOL 布局证据与 RSZ metadata 兼容性结果。
 
 解析出的 `rcol` 和 `rsz` 结构用于辅助理解、定位和后续编辑器开发。未来如果要实现真正的“修改 JSON 后重新打包”，推荐按这个顺序推进：
 
@@ -330,7 +331,7 @@ v2: Data
 ## 当前限制
 
 - RCOL 外层仍有部分字段没有最终命名，脚本在 `repack` 的 `_raw` 中保留。
-- Collider 记录、Group 记录、RequestSet 记录已经集中在 layout 表中，但这些仍然是 RCOL native 外层结构，不属于 RSZ schema；后续如果遇到不同游戏版本，需要增加版本化 layout。
+- RCOL native 外层结构不属于 RSZ schema。当前会自动探测 Group/RequestSet 的计数、偏移、步长和 RequestSet 核心字段；对于无法满足强不变量或候选置信度不足的文件会明确失败，不会静默套用某个版本画像。
 - `repack` 格式已经无损携带原始 bytes，但尚未实现“修改字段后重新生成二进制”的 pack 命令。
 - `il2cpp_dump.json` 很大，脚本使用 mmap 按需抽取类和 enum，并有进程内缓存；首次解析某类资源时会慢一些。
 - `readable` 格式会省略 `_raw` 和 object table 内部索引，适合阅读但不是无损格式；需要无损保存时应使用 `--format repack`。
@@ -344,6 +345,8 @@ v2: Data
 - 首个 shape 的 GUID、类型、参数、主/副关节名均与参考一致。
 - 首个 request set 的 `userData` 展开结果与参考一致，包括 enum 符号位和 `ace.Bitset` 空值处理。
 - `repack` JSON 中 `_binary.data` 还原出的字节与源文件完全一致，SHA-256 为 `749e9e1639e43a7c514b5215b08ef44332030b0a6aab4ccb75fe14acc3e26f38`。
+
+另外对项目中的 2,892 个 `.rcol.28/.rcol.38` 文件进行了外层结构回归，全部自动探测成功，Group 和 RequestSet 数量均与文件头的独立证据一致。对 OWotS Benchmark 的 268 个 `.rcol.37` 文件使用显式指定的 `rszOWotS_Benchmark.json` 和 `il2cpp_dump.json` 完整解析后，共得到 443 个 RequestSet 和 823 个 native collider；未知类、CRC 不一致、未解析实例及 `RequestSetIndex` 不一致均为 0。
 
 ## 结论
 

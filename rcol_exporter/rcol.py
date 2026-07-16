@@ -17,7 +17,9 @@ from .binary import (
     scan_string_table,
     section_summary,
     u32,
+    u64,
 )
+from .detect import DetectedLayout, LayoutHint, detect_rcol_layout
 from .layout import (
     GROUP_LAYOUT,
     HEADER_COUNTS,
@@ -35,7 +37,12 @@ from .layout import (
 from .rsz import RszBlockParser, native_field_count_candidates
 
 
-def parse_rcol(path: Path, typedb: TypeDB, il2cpp_path: Path | None = None) -> dict[str, Any]:
+def parse_rcol(
+    path: Path,
+    typedb: TypeDB,
+    il2cpp_path: Path | None = None,
+    layout_hint: LayoutHint | None = None,
+) -> dict[str, Any]:
     data = path.read_bytes()
     result: dict[str, Any] = {
         "source": display_path(path),
@@ -51,18 +58,20 @@ def parse_rcol(path: Path, typedb: TypeDB, il2cpp_path: Path | None = None) -> d
         result["error"] = f"bad_magic:{data[:4]!r}"
         return result
 
-    header = parse_header(data)
+    detected = detect_rcol_layout(data, hint=layout_hint)
+    result["rcol_layout"] = detected.to_dict()
+    header = parse_header(data, detected)
     result["header"] = {key: value for key, value in header.items() if key != "_offset_values"}
     offsets = header["_offset_values"]
-    string_start = likely_string_start(header, len(data))
+    string_start = detected.string_start
     result["strings"] = scan_string_table(data, string_start)
 
-    shape_start = HEADER_SIZE + header["counts"]["groups"] * GROUP_LAYOUT.size
-    groups = parse_groups(data, header)
+    shape_start = detected.groups_offset + detected.group_count * detected.group_stride
+    groups = parse_groups(data, detected)
     shapes = parse_shapes(data, shape_start, offsets["rsz"], il2cpp_path)
     result["groupInfos"] = attach_shapes(data, groups, shapes)
 
-    request_sets = parse_request_sets(data, header)
+    request_sets = parse_request_sets(data, detected)
     rsz_start = offsets["rsz"]
     request_start = offsets["request_sets"]
     rsz_end = request_start if request_start > rsz_start else string_start
@@ -76,9 +85,13 @@ def parse_rcol(path: Path, typedb: TypeDB, il2cpp_path: Path | None = None) -> d
         )
     else:
         result["rsz"] = {"error": "missing_or_invalid_rsz"}
+    result["rcol_layout"]["schema_validation"] = layout_schema_validation(
+        request_sets,
+        result["rsz"],
+    )
     result["requestSets"] = attach_request_userdata(request_sets, result["rsz"])
     result["ignoreTags"] = parse_ignore_tags(data, header, string_start)
-    result["_raw"] = build_raw_sections(data, header, shape_start, string_start)
+    result["_raw"] = build_raw_sections(data, header, detected, shape_start, string_start)
     return result
 
 
@@ -170,8 +183,14 @@ def score_rsz_parse(parsed: dict[str, Any], request_sets: list[dict[str, Any]]) 
     for request_set in request_sets:
         indices = request_set.get("_object_table_indices") or {}
         expected_index = request_set.get("requestSetIndex")
-        for role in ("userData", "nativeShapeCollider"):
-            table_index = indices.get(role)
+        native_start = indices.get("nativeShapeCollider")
+        native_end = indices.get("nativeShapeColliderEnd")
+        table_indices = [indices.get("userData")]
+        if isinstance(native_start, int) and isinstance(native_end, int) and native_end >= native_start:
+            table_indices.extend(range(native_start, native_end))
+        else:
+            table_indices.append(native_start)
+        for table_index in table_indices:
             if not isinstance(table_index, int) or table_index < 0 or table_index >= len(object_table):
                 invalid_object_indices += 1
                 continue
@@ -224,13 +243,46 @@ def count_problem_refs(value: Any) -> int:
     return 0
 
 
-def parse_header(data: bytes) -> dict[str, Any]:
-    offsets = read_named_fields(data, HEADER_OFFSETS)
+def parse_header(data: bytes, detected: DetectedLayout | None = None) -> dict[str, Any]:
+    legacy_offsets = read_named_fields(data, HEADER_OFFSETS)
+    legacy_counts = read_named_fields(data, HEADER_COUNTS)
+    if detected is None:
+        offsets = legacy_offsets
+        counts = legacy_counts
+        raw_u32 = {
+            f"0x{field.offset:02x}": legacy_counts[field.name]
+            for field in HEADER_COUNTS
+        }
+        raw_u64 = {
+            f"0x{field.offset:02x}": legacy_offsets[field.name]
+            for field in HEADER_OFFSETS
+        }
+    else:
+        offsets = dict(legacy_offsets)
+        offsets.update(
+            {
+                "groups": detected.groups_offset,
+                "rsz": detected.rsz_offset,
+                "request_sets": detected.request.table_offset,
+            }
+        )
+        counts = dict(legacy_counts)
+        counts.update(
+            {
+                "groups": detected.group_count,
+                "collider_user_data": max(0, detected.object_count - detected.request.count),
+                "request_sets": detected.request.count,
+            }
+        )
+        raw_u32 = {f"0x{offset:02x}": value for offset, value in detected.raw_u32.items()}
+        raw_u64 = {f"0x{offset:02x}": value for offset, value in detected.raw_u64.items()}
     return {
         "magic": "RCOL",
-        "counts": read_named_fields(data, HEADER_COUNTS),
+        "counts": counts,
         "unknowns": read_named_fields(data, HEADER_UNKNOWNS),
         "offsets": {key: hx(value) for key, value in offsets.items()},
+        "raw_u32": raw_u32,
+        "raw_u64": {key: hx(value) for key, value in raw_u64.items()},
         "_offset_values": offsets,
     }
 
@@ -249,11 +301,11 @@ def likely_string_start(header: dict[str, Any], file_size: int) -> int:
     return fallback if 0 < fallback < file_size else file_size
 
 
-def parse_groups(data: bytes, header: dict[str, Any]) -> list[dict[str, Any]]:
+def parse_groups(data: bytes, layout: DetectedLayout) -> list[dict[str, Any]]:
     groups: list[dict[str, Any]] = []
-    start = header["_offset_values"]["groups"]
-    for index in range(header["counts"]["groups"]):
-        offset = start + index * GROUP_LAYOUT.size
+    start = layout.groups_offset
+    for index in range(layout.group_count):
+        offset = start + index * layout.group_stride
         fields = GROUP_LAYOUT.read(data, offset)
         groups.append(
             {
@@ -271,8 +323,9 @@ def parse_groups(data: bytes, header: dict[str, Any]) -> list[dict[str, Any]]:
                     "name_offset": hx(fields["nameOffset"]),
                     "shape_offset": hx(fields["shapeOffset"]),
                     "mask_offset": hx(fields["maskOffset"]),
-                    "layout": GROUP_LAYOUT.name,
-                    "raw_u32": [u32(data, offset + pos) for pos in range(0, GROUP_LAYOUT.size, 4)],
+                    "shape_count": fields["shapeCount"],
+                    "layout": f"{GROUP_LAYOUT.name}/auto_stride_{layout.group_stride:#x}",
+                    "raw_u32": [u32(data, offset + pos) for pos in range(0, layout.group_stride, 4)],
                 },
             }
         )
@@ -369,38 +422,59 @@ def read_guid_array(data: bytes, offset: int, count: int) -> list[str]:
     ]
 
 
-def parse_request_sets(data: bytes, header: dict[str, Any]) -> list[dict[str, Any]]:
-    start = header["_offset_values"]["request_sets"]
-    count = header["counts"]["request_sets"]
+def parse_request_sets(data: bytes, layout: DetectedLayout) -> list[dict[str, Any]]:
+    request_layout = layout.request
+    start = request_layout.table_offset
+    count = request_layout.count
+    stride = request_layout.stride
+    field_offsets = request_layout.fields
     out: list[dict[str, Any]] = []
     for index in range(count):
-        offset = start + index * REQUEST_SET_LAYOUT.size
-        if offset + REQUEST_SET_LAYOUT.size > len(data):
+        offset = start + index * stride
+        if offset + stride > len(data):
             break
-        fields = REQUEST_SET_LAYOUT.read(data, offset)
+        fields = {
+            name: (
+                u64(data, offset + field_offset)
+                if name in {"nameOffset", "keyNameOffset"}
+                else u32(data, offset + field_offset)
+            )
+            for name, field_offset in field_offsets.items()
+            if offset + field_offset + (8 if name in {"nameOffset", "keyNameOffset"} else 4) <= len(data)
+        }
         out.append(
             {
-                "requestSetID": fields["requestSetID"],
+                "requestSetID": fields.get("requestSetID", 0),
                 "groupIndex": fields["groupIndex"],
-                "status": fields["status"],
+                "status": fields.get("status", 0),
                 "requestSetIndex": fields["requestSetIndex"],
-                "keyHash": fields["keyHash"],
-                "KeyNameMMHash": fields["KeyNameMMHash"],
-                "name": read_string_field(data, fields, "nameOffset"),
-                "keyName": read_string_field(data, fields, "keyNameOffset"),
+                "keyHash": fields.get("keyHash", 0),
+                "KeyNameMMHash": fields.get("KeyNameMMHash", 0),
+                "name": read_string_field(data, fields, "nameOffset") if "nameOffset" in fields else "",
+                "keyName": read_string_field(data, fields, "keyNameOffset") if "keyNameOffset" in fields else "",
                 "_object_table_indices": {
                     "userData": fields["userDataObjectIndex"],
                     "nativeShapeCollider": fields["nativeShapeColliderObjectIndex"],
                 },
                 "_raw": {
                     "offset": hx(offset),
-                    "name_offset": hx(fields["nameOffset"]),
-                    "key_name_offset": hx(fields["keyNameOffset"]),
-                    "layout": REQUEST_SET_LAYOUT.name,
-                    "raw_u32": [u32(data, offset + word) for word in range(0, REQUEST_SET_LAYOUT.size, 4)],
+                    "name_offset": hx(fields.get("nameOffset")),
+                    "key_name_offset": hx(fields.get("keyNameOffset")),
+                    "layout": f"{REQUEST_SET_LAYOUT.name}/auto_stride_{stride:#x}",
+                    "field_offsets": {name: hx(value) for name, value in field_offsets.items()},
+                    "raw_u32": [u32(data, offset + word) for word in range(0, stride, 4)],
                 },
             }
         )
+    object_count = layout.object_count
+    for index, item in enumerate(out):
+        indices = item["_object_table_indices"]
+        end = (
+            out[index + 1]["_object_table_indices"]["userData"]
+            if index + 1 < len(out)
+            else object_count
+        )
+        indices["nativeShapeColliderEnd"] = end
     return out
 
 
@@ -411,16 +485,41 @@ def attach_request_userdata(request_sets: list[dict[str, Any]], rsz: dict[str, A
     for item in request_sets:
         indices = item.pop("_object_table_indices")
         user_root = object_table_value(object_table, indices["userData"])
-        native_root = object_table_value(object_table, indices["nativeShapeCollider"])
-        item["nativeShapeColliders"] = [trees.get(str(native_root), {"Ref": {"ref_instance_id": native_root}})]
+        native_start = indices["nativeShapeCollider"]
+        native_end = indices.get("nativeShapeColliderEnd", native_start + 1)
+        native_roots = [
+            object_table_value(object_table, table_index)
+            for table_index in range(native_start, native_end)
+        ]
+        item["nativeShapeColliders"] = [
+            trees.get(str(native_root), {"Ref": {"ref_instance_id": native_root}})
+            for native_root in native_roots
+        ]
         item["userData"] = trees.get(str(user_root), {"Ref": {"ref_instance_id": user_root}})
         item["_raw"]["object_table_indices"] = indices
         item["_raw"]["instance_roots"] = {
             "userData": user_root,
-            "nativeShapeCollider": native_root,
+            "nativeShapeColliders": native_roots,
         }
         out.append(item)
     return out
+
+
+def layout_schema_validation(request_sets: list[dict[str, Any]], rsz: dict[str, Any]) -> dict[str, Any]:
+    stats = score_rsz_parse(rsz, request_sets)
+    present = int(stats.get("request_index_present") or 0)
+    matches = int(stats.get("request_index_matches") or 0)
+    invalid = int(stats.get("invalid_object_indices") or 0)
+    mismatches = int(stats.get("request_index_mismatches") or 0)
+    return {
+        "valid": invalid == 0 and mismatches == 0,
+        "request_index_present": present,
+        "request_index_matches": matches,
+        "request_index_mismatches": mismatches,
+        "invalid_object_indices": invalid,
+        "missing_refs": stats.get("missing_refs", 0),
+        "unparsed_instances": stats.get("unparsed_instances", 0),
+    }
 
 
 def object_table_value(object_table: list[Any], index: Any) -> Any:
@@ -443,11 +542,17 @@ def parse_ignore_tags(data: bytes, header: dict[str, Any], string_start: int) ->
     return tags
 
 
-def build_raw_sections(data: bytes, header: dict[str, Any], shape_start: int, string_start: int) -> dict[str, Any]:
+def build_raw_sections(
+    data: bytes,
+    header: dict[str, Any],
+    layout: DetectedLayout,
+    shape_start: int,
+    string_start: int,
+) -> dict[str, Any]:
     offsets = header["_offset_values"]
-    request_records_end = offsets["request_sets"] + header["counts"]["request_sets"] * REQUEST_SET_LAYOUT.size
+    request_records_end = layout.request.end
     sections = {
-        "header": section_summary(data, 0, HEADER_SIZE),
+        "header": section_summary(data, 0, layout.groups_offset),
         "groups": section_summary(data, offsets["groups"], shape_start),
         "shapes": section_summary(data, shape_start, offsets["rsz"]),
         "rsz": section_summary(data, offsets["rsz"], offsets["request_sets"]),

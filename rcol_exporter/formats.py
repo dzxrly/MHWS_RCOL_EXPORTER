@@ -7,8 +7,8 @@ from typing import Any
 from .binary import display_path
 
 
-READABLE_FORMAT = "rcol_readable_v2"
-REPACK_FORMAT = "rcol_repack_v2"
+READABLE_FORMAT = "rcol_readable_v3"
+REPACK_FORMAT = "rcol_repack_v3"
 
 
 def strip_private(value: Any) -> Any:
@@ -33,6 +33,10 @@ def build_readable(parsed: dict[str, Any], schema_path: Path, il2cpp_path: Path 
         "groupInfos": strip_private(parsed.get("groupInfos", [])),
         "requestSets": strip_private(parsed.get("requestSets", [])),
         "ignoreTags": strip_private(parsed.get("ignoreTags", [])),
+        "_diagnostics": {
+            "rcol_layout": parsed.get("rcol_layout", {}),
+            "rsz": (parsed.get("rsz") or {}).get("_diagnostics", {}),
+        },
     }
 
 
@@ -42,7 +46,7 @@ def build_repack(parsed: dict[str, Any], schema_path: Path, il2cpp_path: Path | 
         raw = b""
     return {
         "_format": REPACK_FORMAT,
-        "_version": 2,
+        "_version": 3,
         "_source": {
             "path": parsed.get("source"),
             "file_name": parsed.get("file_name"),
@@ -62,6 +66,7 @@ def build_repack(parsed: dict[str, Any], schema_path: Path, il2cpp_path: Path | 
         "ignoreTags": parsed.get("ignoreTags", []),
         "strings": parsed.get("strings", []),
         "rsz": parsed.get("rsz", {}),
+        "rcol_layout": parsed.get("rcol_layout", {}),
         "_raw": parsed.get("_raw", {}),
         "error": parsed.get("error"),
     }

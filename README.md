@@ -24,6 +24,10 @@ python -m pip install -r .\requirements.txt
 
 解析 RSZ 用户数据时，工具会把 RCOL 文件扩展版本作为提示，并结合当前 `rszmhws.json` 自动尝试不同数量的 native `v*` 头字段。候选结果会按 `RequestSetIndex` 一致性、非法引用和未解析 instance 数量打分，避免新版 schema 解析旧文件时出现字段整体错位。
 
+RCOL 外层布局不再依赖需要人工维护的版本画像。每个文件都会根据 `RCOL`/`RSZ` 锚点、区段指针、Group 表边界、RequestSet 连续索引和 RSZ object table 分区等不变量自动探测计数、偏移、步长及核心字段位置。批量转换时会从少量文件生成一次仅存在于内存中的目录共识，用作候选搜索提示；每个文件仍会独立校验，既不会保存画像，也不会替你切换 RSZ/IL2CPP metadata。
+
+`rszmhws.json` 和 `il2cpp_dump.json` 仍由调用方选择。输出诊断中的 `schema_compatibility` 会标记为 `compatible`、`partial` 或 `incompatible`，并同时给出未知类、CRC 不一致、未解析实例和 class coverage，便于识别 metadata 选错或不完整的情况。
+
 ## 快速开始
 
 使用 `main.py` 导出一个目录：
@@ -115,15 +119,23 @@ converter.export_path(
 {
   "groupInfos": [],
   "requestSets": [],
-  "ignoreTags": []
+  "ignoreTags": [],
+  "_diagnostics": {
+    "rcol_layout": {},
+    "rsz": {
+      "schema_compatibility": "compatible"
+    }
+  }
 }
 ```
+
+每个 RequestSet 的 `nativeShapeColliders` 是由当前 `nativeShapeColliderObjectIndex` 到下一个 RequestSet 的 `userDataObjectIndex` 推导出的完整对象区间，因此可以包含零个、一个或多个 collider，不再固定只导出第一个对象。
 
 `repack` 会额外包含：
 
 ```json
 {
-  "_format": "rcol_repack_v2",
+  "_format": "rcol_repack_v3",
   "_binary": {
     "encoding": "hex",
     "sha256": "...",
@@ -143,6 +155,7 @@ rcol_exporter/api.py     对外 Python API
 rcol_exporter/cli.py     CLI 入口
 rcol_exporter/web/       本地 Web 快速导出
 rcol_exporter/layout.py  RCOL 外层结构表和 shape 参数模板
+rcol_exporter/detect.py  RCOL 外层布局自动探测与目录内临时共识
 rcol_exporter/rcol.py    RCOL 容器解析
 rcol_exporter/rsz.py     RSZ 对象图解析
 rcol_exporter/il2cpp.py  il2cpp_dump 按需元数据提取

@@ -22,6 +22,22 @@ def native_prefix_length(cls: Any) -> int:
     return count
 
 
+def schema_compatibility_status(
+    known_classes: int,
+    unknown_classes: int,
+    crc_mismatches: int,
+    unparsed_instances: int,
+) -> str:
+    """Classify the explicitly selected metadata without choosing a replacement."""
+    total = known_classes + unknown_classes
+    coverage = known_classes / total if total else 1.0
+    if unknown_classes == 0 and crc_mismatches == 0 and unparsed_instances == 0:
+        return "compatible"
+    if total and known_classes > 0 and coverage >= 0.8:
+        return "partial"
+    return "incompatible"
+
+
 def native_field_count_candidates(
     block: bytes,
     typedb: TypeDB,
@@ -109,11 +125,22 @@ class RszBlockParser(ExporterFieldParserMixin):
         object_set = set(object_table)
 
         instance_infos: list[dict[str, Any]] = []
+        known_class_count = 0
+        unknown_class_count = 0
+        crc_mismatch_count = 0
         reader.seek(header["instance_offset"])
         for index in range(max(header["instance_count"], 0)):
             class_hash = reader.read_u32()
             crc = reader.read_u32()
             cls = self.typedb.get_class(class_hash)
+            if index > 0:
+                if cls is None:
+                    unknown_class_count += 1
+                else:
+                    known_class_count += 1
+                    schema_crc = getattr(cls, "crc", None)
+                    if isinstance(schema_crc, int) and schema_crc != crc:
+                        crc_mismatch_count += 1
             instance_infos.append(
                 {
                     "index": index,
@@ -137,6 +164,13 @@ class RszBlockParser(ExporterFieldParserMixin):
             for root_id in object_table
             if isinstance(root_id, int) and root_id > 0
         }
+        unparsed_instance_count = sum(1 for item in parsed_instances if item.get("unparsed"))
+        schema_class_total = known_class_count + unknown_class_count
+        schema_class_coverage = (
+            round(known_class_count / schema_class_total, 6)
+            if schema_class_total
+            else 1.0
+        )
 
         return {
             "header": {
@@ -154,7 +188,17 @@ class RszBlockParser(ExporterFieldParserMixin):
             "_diagnostics": {
                 "native_field_count": self.native_field_count,
                 "has_request_set_index": self.has_request_set_index,
-                "unparsed_instances": sum(1 for item in parsed_instances if item.get("unparsed")),
+                "unparsed_instances": unparsed_instance_count,
+                "schema_known_classes": known_class_count,
+                "schema_unknown_classes": unknown_class_count,
+                "schema_crc_mismatches": crc_mismatch_count,
+                "schema_class_coverage": schema_class_coverage,
+                "schema_compatibility": schema_compatibility_status(
+                    known_class_count,
+                    unknown_class_count,
+                    crc_mismatch_count,
+                    unparsed_instance_count,
+                ),
             },
         }
 
